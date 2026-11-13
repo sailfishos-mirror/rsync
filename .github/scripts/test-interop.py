@@ -1,4 +1,5 @@
 import copy
+from contextlib import redirect_stderr
 import io
 import json
 import os
@@ -9,7 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import urllib.error
 import zipfile
 
@@ -236,6 +237,55 @@ class Network(unittest.TestCase):
             broker['cleanup'](API(), lease)
         self.assertEqual(calls, ['1', '2', 'key1'])
 
+    def test_finish_without_enrolment_needs_no_network_cleanup(self):
+        (self.root / 'keys.json').unlink()
+        with patch.object(sys, 'argv', ['interop-broker.py', 'finish', '--root', str(self.root)]), \
+                patch.dict(broker['main'].__globals__, identity=lambda: self.state,
+                           Tailnet=lambda: self.fail('Empty cleanup obtained network authority')):
+            self.assertEqual(broker['main'](), 0)
+        result = json.loads((self.root / 'result.json').read_text())
+        self.assertFalse(result['passed'])
+        self.assertTrue(result['cleaned'])
+        self.assertEqual(result['roles'], [])
+
+    def test_interrupted_key_creation_is_not_empty_cleanup(self):
+        (self.root / 'keys.json').unlink()
+        def issue(role, state):
+            self.assertEqual(broker['load'](self.root, 'keys')['keys'], {})
+            raise network.NetworkError('Key response lost')
+        api = Mock()
+        api.policy.return_value = ({}, {})
+        api.create_key.side_effect = issue
+        recipients = {role: {'public_key': role} for role in ROLES}
+        with patch.dict(broker['main'].__globals__, identity=lambda: self.state, Tailnet=lambda: api,
+                        records=lambda *args, **kwargs: recipients, check_policy=lambda policy: None), \
+                redirect_stderr(io.StringIO()):
+            for phase in ('broker', 'finish'):
+                with patch.object(sys, 'argv', ['interop-broker.py', phase, '--root', str(self.root)]):
+                    self.assertEqual(broker['main'](), 1)
+        self.assertFalse((self.root / 'result.json').exists())
+
+    def test_recovery_does_not_repeat_completed_cleanup(self):
+        run = dict(id=456, run_attempt=1, path='.github/workflows/interoperability.yml', head_branch='master',
+                   event='workflow_run', head_sha='c' * 40, repository=dict(id=266877886))
+        job = dict(name='Admission and cleanup', run_id=456, run_attempt=1, status='completed',
+                   steps=[dict(name='Verify revocation and remove devices', conclusion='success')])
+        variants = [job, {**job, 'run_id': 999}, {**job, 'run_attempt': 2}, {**job, 'status': 'in_progress'},
+                    {**job, 'steps': []}]
+        variants += [{**job, 'steps': [dict(name='Verify revocation and remove devices', conclusion=value)]}
+                     for value in ('failure', 'cancelled', 'skipped', None)]
+        for index, candidate in enumerate(variants):
+            responses = [(json.dumps(run).encode(), {}), (json.dumps({'jobs': [candidate]}).encode(), {})]
+            with self.subTest(index=index), patch.dict(os.environ, INTEROP_RECOVER_RUN='456', INTEROP_RECOVER_ATTEMPT='1'), \
+                    patch.object(network, 'fetch', side_effect=responses), \
+                    patch.dict(broker['recover'].__globals__, download_records=Mock(side_effect=network.NetworkError('lease required')),
+                               Tailnet=lambda: self.fail('Recovery obtained authority without a verified lease')):
+                if index == 0:
+                    broker['recover'](self.root)
+                else:
+                    with self.assertRaisesRegex(network.NetworkError, 'lease required'):
+                        broker['recover'](self.root)
+
     def test_recovery_verifies_exact_bytes_before_any_mutation(self):
         run = dict(id=456, run_attempt=1, path='.github/workflows/interoperability.yml',
                    head_branch='master', event='workflow_run', head_sha='c' * 40, repository=dict(id=266877886))
@@ -252,7 +302,7 @@ class Network(unittest.TestCase):
                            cleanup=lambda *args: self.fail('Mutation preceded attestation')), \
                 patch.object(subprocess, 'run', side_effect=verified):
             with self.assertRaisesRegex(network.NetworkError, 'attested'):
-                broker['recover'](self.root, None)
+                broker['recover'](self.root)
 
     def test_cancelled_or_superseded_ci_aborts_rendezvous(self):
         for current in (dict(run_attempt=3), dict(run_attempt=2, conclusion='cancelled'),
@@ -293,7 +343,7 @@ class Network(unittest.TestCase):
                            cleanup=lambda *args: self.fail('Stale lease reached cleanup')), \
                 patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
             with self.assertRaisesRegex(network.NetworkError, 'attested'):
-                broker['recover'](self.root, None)
+                broker['recover'](self.root)
 
     def test_artifact_archive_retry_and_duplicates(self):
         record = dict(self.state, role='linux')
